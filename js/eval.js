@@ -43,6 +43,60 @@ DP.eval = (function () {
     return { pass: issues.length === 0, issues: issues, totalMinutes: total };
   }
 
+  /* ---------- 复盘 / 周报校验（2026-10-16 补齐） ----------
+   * 设计说明：这两类输出只做「格式门」，不做「质量门」。
+   *   规划是「生成物」——质量不达标就该重新生成；
+   *   复盘 / 周报是「诊断与总结」——低分本身就是合法结果（那天确实没做好），
+   *   拦截低分等于把真实诊断藏起来。所以只校验结构与字段。
+   * 调用时用 threshold: null 表达「只做格式门」。
+   */
+  function validateReview(out) {
+    var issues = [];
+    if (!out || typeof out !== "object") return { pass: false, issues: ["复盘输出不是合法对象"] };
+
+    var s = parseInt(out.score, 10);
+    if (!(s >= 1 && s <= 10)) issues.push("score 非法（需 1-10 整数）：" + String(out.score));
+
+    if (!out.comment || !String(out.comment).trim()) issues.push("缺少总体点评 comment");
+    else if (String(out.comment).length > 120) issues.push("comment 过长（" + String(out.comment).length + " > 120 字）");
+
+    if (!out.diagnosis || !String(out.diagnosis).trim()) issues.push("缺少问题诊断 diagnosis");
+    else if (String(out.diagnosis).length > 120) issues.push("diagnosis 过长（" + String(out.diagnosis).length + " > 120 字）");
+
+    if (!Array.isArray(out.suggestions) || out.suggestions.length < 2) issues.push("suggestions 少于 2 条");
+    else if (out.suggestions.some(function (x) { return !x || !String(x).trim(); })) issues.push("suggestions 含空条目");
+
+    return { pass: issues.length === 0, issues: issues };
+  }
+
+  function validateWeekly(report) {
+    var issues = [];
+    var txt = (typeof report === "string") ? report : (report && report.report);
+    if (!txt || !String(txt).trim()) return { pass: false, issues: ["周报为空"] };
+    txt = String(txt).trim();
+    if (txt.length < 30) issues.push("周报过短（" + txt.length + " 字 < 30）");
+    else if (txt.length > 400) issues.push("周报过长（" + txt.length + " 字 > 400）");
+    return { pass: issues.length === 0, issues: issues };
+  }
+
+  /* ---------- 异常分类：决定「网络 / JSON 抖动」要不要重试 ----------
+   * 2026-10-16 修复：原来 opts.generate 抛错会直接冒泡出 gate()，
+   * 网络中断 / 模型返回非 JSON / 限流，全都算「失败」，一次都不重试。
+   */
+  function classifyError(err) {
+    var msg = String((err && err.message) || err || "");
+    // 鉴权类：重试没有意义，直接中止，让用户去改 Key
+    if (/API 错误 (401|403)/.test(msg) || /invalid api key|unauthorized|Incorrect API/i.test(msg)) {
+      return { retriable: false, kind: "auth", message: msg };
+    }
+    // 限流 / 服务端错误 / 网络中断 / 输出非 JSON：可重试的瞬时故障
+    if (/API 错误 (429|5\d\d)/.test(msg) || /模型输出不是合法 JSON/.test(msg) ||
+        /Failed to fetch|NetworkError|network|timeout|ECONN|ETIMEDOUT/i.test(msg)) {
+      return { retriable: true, kind: "transient", message: msg };
+    }
+    return { retriable: true, kind: "unknown", message: msg };
+  }
+
   /**
    * L2 启发式打分（Mock 模式 / LLM judge 的降级方案）
    * 维度：时长利用率、优先级结构、目标覆盖度
@@ -86,38 +140,73 @@ DP.eval = (function () {
    * @returns {Promise<{ok, result, report}>}
    */
   async function gate(opts) {
-    var threshold = opts.threshold || 7;
+    // threshold 传 null → 只做格式门，不做质量门（复盘 / 周报用）
+    var threshold = opts.threshold === undefined ? 7 : opts.threshold;
     var maxRetries = opts.maxRetries == null ? 2 : opts.maxRetries;
     var attempts = [];
     var best = null;
 
     for (var attempt = 0; attempt <= maxRetries; attempt++) {
-      var result = await opts.generate(attempt);
-      var v = opts.validate(result);
-      var j = v.pass ? await opts.judge(result) : { score: 0, comment: "规则校验未通过，跳过质量打分" };
-      var rec = { attempt: attempt + 1, pass: v.pass && j.score >= threshold, issues: v.issues || [], score: j.score, comment: j.comment };
-      attempts.push(rec);
+      var result, v, j, rec;
 
-      if (!best || (v.pass && j.score > (best._score || -1))) {
-        best = result; best._score = v.pass ? j.score : -1;
+      // 2026-10-16 修复：generate 抛错不再直接冒泡，而是计入一次尝试
+      try {
+        result = await opts.generate(attempt);
+        v = opts.validate(result);
+        j = (v.pass && opts.judge) ? await opts.judge(result) : null;
+      } catch (err) {
+        var c = classifyError(err);
+        attempts.push({
+          attempt: attempt + 1,
+          pass: false,
+          score: 0,
+          comment: c.message,
+          issues: ["调用异常（" + c.kind + "）"],
+          error: { kind: c.kind, retriable: c.retriable, message: c.message }
+        });
+        if (!c.retriable) break; // 401/403 之类，重试也没用，直接中止
+        continue;
       }
-      if (rec.pass) break;
+
+      var score = j ? j.score : null;
+      var pass = v.pass && (threshold === null || score === null || score >= threshold);
+      attempts.push({
+        attempt: attempt + 1,
+        pass: pass,
+        issues: v.issues || [],
+        score: score,
+        comment: j ? j.comment : ""
+      });
+
+      if (!best || (v.pass && (!j || score > (best._score || -1)))) {
+        best = result;
+        if (best && typeof best === "object") best._score = j ? score : 0;
+      }
+      if (pass) break;
     }
 
-    var finalRec = attempts[attempts.length - 1];
+    var finalRec = attempts[attempts.length - 1] || { pass: false };
     var report = {
       name: opts.name,
       attempts: attempts,
       retries: attempts.length - 1,
-      finalPass: finalRec.pass,
-      finalScore: finalRec.score,
+      finalPass: !!finalRec.pass,
+      finalScore: finalRec.score == null ? null : finalRec.score,
       mode: DP.llm && DP.llm.isLive() ? "live" : "mock",
-      threshold: threshold
+      threshold: threshold,
+      errors: attempts.filter(function (a) { return a.error; }).length
     };
 
-    if (best && best._score !== undefined) delete best._score;
-    return { ok: finalRec.pass, result: finalRec.pass ? result : best, report: report };
+    if (best && typeof best === "object" && best._score !== undefined) delete best._score;
+    return { ok: !!finalRec.pass, result: best, report: report };
   }
 
-  return { validatePlan: validatePlan, heuristicScore: heuristicScore, gate: gate };
+  return {
+    validatePlan: validatePlan,
+    validateReview: validateReview,
+    validateWeekly: validateWeekly,
+    classifyError: classifyError,
+    heuristicScore: heuristicScore,
+    gate: gate
+  };
 })();

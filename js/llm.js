@@ -116,12 +116,14 @@ DP.llm = (function () {
   var REVIEW_SYS = "你是 DayPilot 的晚间复盘教练。根据今日任务完成情况输出复盘。" +
     '只输出 JSON：{"score": 1到10的整数, "comment": "总体点评80字内", "diagnosis": "问题诊断60字内，无问题则写亮点", "suggestions": ["明日建议1","明日建议2","明日建议3"]}';
 
-  async function generateReview(day, goals) {
+  async function generateReview(day, goals, attempt) {
     if (isLive()) {
       var user = "目标池：" + goals.join("；") + "\n今日任务：\n" +
         day.tasks.map(function (t) {
           return "- [" + t.priority + "] " + t.title + "（" + t.minutes + "分钟）" + (t.done ? " ✅完成" : " ❌未完成");
         }).join("\n");
+      // 2026-10-16：重试时把上一次失败原因告诉模型，与规划一致
+      if (attempt > 0) user += "\n（上一次输出未通过结构校验，请严格遵守 JSON 结构与字数限制重新输出）";
       return await chatLive(REVIEW_SYS, user);
     }
     return mockReview(day);
@@ -157,7 +159,7 @@ DP.llm = (function () {
   }
 
   /* ---------- 周报 ---------- */
-  async function generateWeekly(days7) {
+  async function generateWeekly(days7, attempt) {
     var totalT = 0, doneT = 0, reviews = 0;
     days7.forEach(function (d) { totalT += d.total; doneT += d.done; if (d.hasReview) reviews++; });
     var rate = totalT ? Math.round(doneT / totalT * 100) : 0;
@@ -167,8 +169,10 @@ DP.llm = (function () {
       var user = "近7天数据：" + days7.map(function (d) {
         return d.date + " 完成" + d.done + "/" + d.total;
       }).join("；") + "\n请输出 150 字内的中文周报，含数据总结、趋势判断、下周 1 条核心建议。";
+      // 2026-10-16：重试时说明上一次失败原因
+      if (attempt > 0) user += "\n（上一次输出未通过校验，请严格按 JSON 结构输出 30-400 字的 report 字段）";
       var txt = await chatLive("你是个人效能周报撰写助手，只输出JSON：{\"report\":\"...\"}", user);
-      return txt.report;
+      return txt && txt.report;
     }
     await sleep(900);
     return "【DayPilot 周报】\n" +

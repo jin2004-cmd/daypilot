@@ -328,7 +328,7 @@ window.DP = window.DP || {};
     else html += logs.slice(0, 10).map(function (l) {
       var dt = new Date(l.ts);
       var time = (dt.getMonth() + 1) + "/" + dt.getDate() + " " + String(dt.getHours()).padStart(2, "0") + ":" + String(dt.getMinutes()).padStart(2, "0");
-      return "<div class='eval-log-item'><div class='el-head'><span>" + (l.name === "plan" ? "📋 规划" : l.name === "review" ? "🌙 复盘" : esc(l.name)) +
+      return "<div class='eval-log-item'><div class='el-head'><span>" + (l.name === "plan" ? "📋 规划" : l.name === "review" ? "🌙 复盘" : l.name === "weekly" ? "📝 周报" : esc(l.name)) +
         " · " + (l.finalPass ? "✅ 通过" : "⚠️ 未达标") + "</span><span>" + (l.finalScore != null ? l.finalScore + "/10" : "") + "</span></div>" +
         "<div class='el-detail'>" + time + " · " + (l.mode === "live" ? "DeepSeek" : "Mock") + " · 重试 " + l.retries + " 次" +
         (l.issues && l.issues.length ? "<br>首次拦截：" + l.issues.map(esc).join("；") : "") + "</div></div>";
@@ -467,24 +467,22 @@ window.DP = window.DP || {};
       route("review");
       startLoading(["🌙 AI 教练复盘ing…", "🔍 输出结构校验中…"]);
       try {
-        var attempts = [], review = null;
-        for (var i = 0; i < 2; i++) {
-          var r = await DP.llm.generateReview(day, DP.store.goals());
-          var issues = [];
-          if (!r || typeof r !== "object") issues.push("输出不是合法对象");
-          else {
-            if (!(r.score >= 1 && r.score <= 10)) issues.push("score 不在 1-10");
-            if (!r.comment) issues.push("缺少总体点评");
-            if (!Array.isArray(r.suggestions) || !r.suggestions.length) issues.push("缺少明日建议");
-          }
-          attempts.push({ attempt: i + 1, pass: !issues.length, issues: issues, score: r && r.score });
-          if (!issues.length) { review = r; break; }
-        }
-        if (!review) review = { score: 5, comment: "复盘生成异常，这是兜底结果。", diagnosis: "LLM 输出连续未通过校验。", suggestions: ["明天再试一次复盘"] };
+        // 2026-10-16 修复：原来这段是写在 app.js 里的简版校验（只查 3 项、异常不重试）。
+        // 现在改走 DP.eval.gate，与规划共用同一套门。
+        // threshold: null = 只做格式门——复盘的分数是给用户的诊断，低分是合法结果，不能拦截。
+        var res = await DP.eval.gate({
+          name: "review",
+          generate: function (attempt) { return DP.llm.generateReview(day, DP.store.goals(), attempt); },
+          validate: function (r) { return DP.eval.validateReview(r); },
+          threshold: null, maxRetries: 2
+        });
+        var review = res.result;
+        if (!review) review = { score: 5, comment: "复盘生成异常，这是兜底结果。", diagnosis: "LLM 输出连续未通过结构校验或调用异常。", suggestions: ["明天再试一次复盘"] };
         DP.store.setReview(DP.store.dateStr(), review);
         DP.store.logEval({
-          name: "review", retries: attempts.length - 1, finalPass: !!attempts[attempts.length - 1].pass,
-          finalScore: review.score, mode: DP.llm.isLive() ? "live" : "mock", issues: attempts[0].issues
+          name: "review", retries: res.report.retries, finalPass: res.report.finalPass,
+          finalScore: review.score, mode: res.report.mode,
+          issues: res.report.attempts[0] ? res.report.attempts[0].issues : []
         });
       } catch (e) {
         toast("复盘失败：" + e.message);
@@ -501,7 +499,20 @@ window.DP = window.DP || {};
     runWeekly: async function () {
       toast("📝 周报生成中…");
       try {
-        var report = await DP.llm.generateWeekly(DP.store.lastNDays(7));
+        // 2026-10-16 修复：周报此前零校验零重试，现在纳入 eval 门（只做格式门）
+        var res = await DP.eval.gate({
+          name: "weekly",
+          generate: function (attempt) { return DP.llm.generateWeekly(DP.store.lastNDays(7), attempt); },
+          validate: function (r) { return DP.eval.validateWeekly(r); },
+          threshold: null, maxRetries: 2
+        });
+        var report = res.result;
+        if (!report) { toast("周报生成失败，请稍后重试"); return; }
+        DP.store.logEval({
+          name: "weekly", retries: res.report.retries, finalPass: res.report.finalPass,
+          finalScore: null, mode: res.report.mode,
+          issues: res.report.attempts[0] ? res.report.attempts[0].issues : []
+        });
         openModal("📝 本周周报", esc(report),
           "<button class='btn' onclick='DP.ui.closeModal()'>关闭</button>" +
           "<button class='btn btn-primary' onclick='DP.ui.copyText(" + JSON.stringify(JSON.stringify(report)) + ")'>📋 复制</button>");
